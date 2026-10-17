@@ -1,0 +1,89 @@
+#!/bin/zsh
+# osc52pty - run a command (default: $SHELL) in a pty, strip OSC 52 clipboard
+# sequences from its output and send their payload to the local clipboard.
+# For terminals without OSC 52 support (e.g. Terminal.app).
+#
+#   osc52pty [command [args...]]
+#
+# Test from inside:
+#   printf '\e]52;c;%s\a' "$(printf 'THE TEXT' | base64)"
+
+emulate -L zsh
+zmodload zsh/system || exit 1
+
+copy=( ${(Q)${(z)${OSC52PTY_COPY:-pbcopy}}} )
+osc52_max=16777216  # give up on an unterminated sequence past this many bytes
+
+# OSC 52 payload is "<selection>;<base64>"; "?" is a read request, ignore it.
+clip() {
+  local b64=${1#*;}
+  [[ $b64 == '?' ]] && return
+  print -rn -- $b64 | base64 -d 2>/dev/null | $copy
+}
+
+# Feed one chunk of output: what should reach the terminal is appended to
+# $out, and an incomplete sequence (or what may be the start of one) is kept
+# in $buf for the next call. Each ESC ] 52 ; ... (BEL | ESC \) goes to clip.
+osc52_feed() {
+  local start=$'\e]52;' rest bel st p
+  buf+=$1
+  while [[ $buf == *$start* ]]; do
+    out+=${buf%%$start*}
+    rest=${buf#*$start}
+    bel=${rest%%$'\a'*} st=${rest%%$'\e\\'*}
+    if (( $#bel < $#st )); then buf=${rest:$#bel+1}; clip $bel
+    elif (( $#st < $#rest )); then buf=${rest:$#st+2}; clip $st
+    else buf=$start$rest; break
+    fi
+  done
+  if [[ $buf == $start* ]]; then
+    (( $#buf > osc52_max )) && out+=$buf buf=
+  else
+    for p in ${start[1,4]} ${start[1,3]} ${start[1,2]} ${start[1]} ''; do
+      [[ $buf == *$p ]] && break
+    done
+    out+=${buf%$p} buf=$p
+  fi
+}
+
+# Copy stdin to stdout through osc52_feed, chunk by chunk (no line buffering).
+filter() {
+  setopt localoptions nomultibyte
+  local buf chunk out
+  while :; do
+    sysread -s 65536 chunk
+    case $? in
+      0) ;;
+      2) (( ERRNO == 4 )) && continue ;&   # EINTR
+      *) (( $#buf )) && syswrite -- $buf; return ;;
+    esac
+    out=
+    osc52_feed $chunk
+    (( $#out )) && syswrite -- $out
+  done
+}
+
+# sourced (by the tests): just define the functions
+[[ $ZSH_EVAL_CONTEXT == *:file ]] && return
+
+(( $# )) || set -- ${SHELL:-/bin/sh}
+
+# macOS script(1) doesn't pass window size changes on to the inner pty, so
+# find it (the tty of script's child) and copy our size onto it.
+inner=
+TRAPWINCH() {
+  if [[ -z $inner ]]; then
+    local spid=$(pgrep -P $$ -x script)
+    [[ -n $spid ]] && inner=$(ps -o tty= -p "$(pgrep -P $spid)" 2>/dev/null)
+    inner=${inner// /}
+    [[ $inner == ttys* ]] || { inner=; return }
+  fi
+  local -a size=( $(stty -f /dev/tty size) )
+  stty -f /dev/$inner rows $size[1] cols $size[2] 2>/dev/null
+}
+# lets a .zshrc that execs us tell it's already inside
+export OSC52PTY=1
+# filter in its own process so this shell is free to run the trap right away
+setopt traps_async
+script -q /dev/null "$@" | ( unfunction TRAPWINCH; filter )
+exit $pipestatus[1]
